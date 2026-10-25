@@ -1,0 +1,24 @@
+--- /tmp/v0310-pristine/cudagraph_utils.py	2026-10-25 17:29:39
++++ cudagraph_utils.py	2026-10-25 17:11:11
+@@ -30,6 +30,7 @@
+ )
+ from vllm.forward_context import BatchDescriptor, set_forward_context
+ from vllm.logger import init_logger
++from vllm.model_executor.models.interfaces import requires_raw_input_tokens
+ from vllm.model_executor.offloader.base import get_offloader
+ from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+@@ -666,8 +667,11 @@
+                 **model_state.prepare_dummy_inputs(num_reqs, num_tokens),
+             }
+             if not self.is_first_pp_rank:
+-                # Update for non-first PP ranks.
+-                model_inputs["input_ids"] = None
++                # Update for non-first PP ranks. Keep input_ids when
++                # the model requires raw tokens (vision MoE routing
++                # reads bias_vl per token id).
++                if not requires_raw_input_tokens(model):
++                    model_inputs["input_ids"] = None
+                 model_inputs["inputs_embeds"] = None
+                 assert intermediate_tensors is not None
+                 model_inputs["intermediate_tensors"] = intermediate_tensors[:num_tokens]

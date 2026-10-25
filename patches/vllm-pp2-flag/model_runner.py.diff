@@ -1,0 +1,17 @@
+--- /tmp/v0310-pristine/v1_worker_gpu_model_runner.py	2026-10-25 17:29:38
++++ model_runner.py	2026-10-25 17:11:11
+@@ -1921,8 +1921,12 @@
+             **self.model_state.prepare_inputs(input_batch, self.req_states),
+         }
+         if not self.is_first_pp_rank:
+-            # Update for non-first PP ranks.
+-            model_inputs["input_ids"] = None
++            # Update for non-first PP ranks. Keep input_ids when the
++            # model requires raw tokens (vision MoE routing reads
++            # bias_vl per token id; the ids are not consumed by the
++            # layers themselves on non-first ranks).
++            if not requires_raw_input_tokens(self.model):
++                model_inputs["input_ids"] = None
+             model_inputs["inputs_embeds"] = None
+ 
+             # Prepare the intermediate tensors.
