@@ -6,6 +6,7 @@
 # Loaded via PYTHONPATH sitecustomize at engine start.
 
 import importlib
+import os
 
 _TARGETS = [
     ("vllm.models.deepseek_v41.nvidia.model", "DeepseekV4Model"),
@@ -24,3 +25,9 @@ for _module_name, _class_name in _TARGETS:
     except ImportError:
         # Wrong image or missing module: nothing to gate, let the boot speak.
         pass
+
+# Opt-in PP-aware FlashInfer autotune (see README, "FlashInfer autotune
+# under PP2"). Stock v0.31.0 barriers over the world group, which deadlocks
+# when the two PP stages tune different op sets.
+if os.environ.get("VLLM_PATCH_PP_AUTOTUNE") == "1":
+    import pp_autotune  # noqa: F401  (applies the monkeypatch on import)

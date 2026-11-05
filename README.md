@@ -101,7 +101,9 @@ recipe/               # the running lane (as deployed on the pair; IPs and
   preflight.sh        # pre-launch checks
   stage_host_rdma.sh  # host rdma-core staging for the container
 patches/
-  vllm-pp2-flag/      # the four overlays + sitecustomize + .diff files
+  vllm-pp2-flag/      # the four overlays + sitecustomize + .diff files,
+                      # plus pp_autotune.py (PP-aware autotune, opt-in via
+                      # VLLM_PATCH_PP_AUTOTUNE=1)
 verify/               # the instruments used to validate the lane
   texts_prod.py       # train-prompt determinism receipt (md5 ×3)
   pp2_receipts.py     # 24-prompt parity sweep + counter-based acceptance
@@ -154,6 +156,60 @@ is numerically what single-GPU execution would be. Generation is
 deterministic within a parallel shape. If you need cross-mode
 reproducibility for audits, scope that contract to a single mode.
 
+## FlashInfer autotune under PP2 — the world-barrier bug
+
+Turning autotune on (`--enable-flashinfer-autotune`) with stock v0.31.0 makes
+this pair unbootable. `flashinfer_autotune()` broadcasts and barriers over the
+**world** group and only the **leader** saves, but under PP each stage tunes a
+different op set (rank 1 additionally tunes the DSpark drafter). Rank 0
+finishes its tune, hits `world.barrier()` (`kernel_warmup.py:480`), and waits
+for rank 1's much longer tune; the gloo group times out (~1800 s default,
+`cpu_distributed_timeout_seconds`) and the engine dies with
+`EngineDeadError`. Measured three times, all at ~44 min:
+
+```
+kernel_warmup.py:480   world.barrier()
+parallel_state.py:1362 torch.distributed.barrier(group=self.cpu_group)
+RuntimeError: [gloo/transport/tcp/pair.cc:553] Connection closed by peer ...
+```
+
+Worse, rank 1's drafter tactics are never persisted (leader-only save), so
+every boot re-tunes them.
+
+`patches/vllm-pp2-flag/pp_autotune.py` fixes both, gated by
+`VLLM_PATCH_PP_AUTOTUNE=1`:
+
+- cache file per PP stage (`autotune_configs.pp0.json`, `.pp1.json`)
+- broadcast/barrier scoped to the TP group (size 1 per stage here, so no
+  cross-rank collectives at all)
+- no world barrier; each rank saves its own tactics and proceeds
+
+Measured after adoption (2026-11-05, same prompts, temp 0):
+
+| metric | autotune off | autotune + overlay |
+|---|---|---|
+| C1 tok/s | 391 | **407.9** (+4.3%, 4 runs x 3 reps, spread 0.1%) |
+| md5 (train prompt) | 616400039175 | cb6c80a8fb12 (x12 identical) |
+| completion tokens | 293 | 301 |
+| GSM8K | 97/100 | **99/100** |
+| acceptance length | ~3.7 | 3.73 |
+| KV pool | 45,521,213 | 45,521,213 (unchanged) |
+
+Warm-boot prediction, not yet measured: with both `pp*.json` files present the
+next boot should skip tuning entirely (`tune_mode` only profiles missing keys).
+
+**Two traps found on the way.**
+
+1. `--kv-cache-dtype` is resolved by the attention backend. Under
+   `FLASHMLA_MEGA_ATTN_DSV41` an unspecific value becomes `nvfp4_ds_mla`
+   (4-bit compressed cache), not `fp8`. Spell `fp8_ds_mla` explicitly if you
+   want the production KV format.
+2. `FLASHMLA_MEGA_ATTN_DSV41` is a **regression at C1** on this pair:
+   364.4 tok/s vs 391 (-6.8%, 9 samples, spread <0.5%), KV pool -5.2%, and
+   +1.51 GiB persistent on rank 1 (155.34 vs 153.83 GiB across three
+   production boots). The fused kernel's fixed tile cost does not amortize at
+   six tokens. Kept here as a negative result so it is not re-run.
+
 ## Upstream
 
 Three changes belong in vLLM proper, in this order (links to follow):
@@ -165,6 +221,10 @@ Three changes belong in vLLM proper, in this order (links to follow):
 3. DeepSeek V4.1 PP + DSpark enablement (fixes 1–2, plus a
    partition-independent pack/collect for the aux states so any split
    works) — vendor-tree dependent; tracked here. [link]
+4. `flashinfer_autotune()` under pipeline parallelism: scope the
+   broadcast/barrier to the TP group and save per PP stage instead of
+   leader-only over the world group (see the autotune section above) — the
+   overlay here is the working shape. [link]
 
 ## Credits
 

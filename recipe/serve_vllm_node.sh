@@ -34,7 +34,10 @@ fi
 
 docker_env=(
   --env "VLLM_HOST_IP=$node_ip"
-  --env "VLLM_ENGINE_READY_TIMEOUT_S=3600"
+  # 7200: a cold FlashInfer autotune boot can exceed an hour; 3600 kills it
+  # mid-tune. Paired with VLLM_PATCH_PP_AUTOTUNE=1 (see README).
+  --env "VLLM_ENGINE_READY_TIMEOUT_S=7200"
+  --env "VLLM_PATCH_PP_AUTOTUNE=$VLLM_PATCH_PP_AUTOTUNE"
   --env "VLLM_USE_RUST_FRONTEND=$VLLM_RUST_FRONTEND"
   --env "VLLM_ALLREDUCE_USE_SYMM_MEM=0"
   --env "VLLM_ALLREDUCE_USE_FLASHINFER=0"
