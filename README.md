@@ -126,7 +126,7 @@ verify/               # the instruments used to validate the lane
 
 ## Running it
 
-Hardware: two DGX Station GB300, a 400G CX8 rail between them, DeepSeek V4.1
+Hardware: two DGX Station GB300, 2 400G CX8 rails between them, DeepSeek V4.1
 Flash checkpoint on local NVMe, image `vllm/vllm-openai:v0.31.0`.
 
 1. Fill the placeholder IPs/ssh targets in `recipe/config.env` for your pair.
