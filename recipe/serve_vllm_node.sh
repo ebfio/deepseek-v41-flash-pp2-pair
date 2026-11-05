@@ -37,6 +37,7 @@ docker_env=(
   # 7200: a cold FlashInfer autotune boot can exceed an hour; 3600 kills it
   # mid-tune. Paired with VLLM_PATCH_PP_AUTOTUNE=1 (see README).
   --env "VLLM_ENGINE_READY_TIMEOUT_S=7200"
+  --env "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=$VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"
   --env "VLLM_PATCH_PP_AUTOTUNE=$VLLM_PATCH_PP_AUTOTUNE"
   --env "VLLM_USE_RUST_FRONTEND=$VLLM_RUST_FRONTEND"
   --env "VLLM_ALLREDUCE_USE_SYMM_MEM=0"
@@ -146,6 +147,8 @@ args=(
 [[ "$VLLM_ASYNC_SCHEDULING" == 0 ]] && args+=(--no-async-scheduling)
 [[ -n "${VLLM_KV_CACHE_DTYPE:-}" ]] && args+=(--kv-cache-dtype "$VLLM_KV_CACHE_DTYPE")
 [[ -n "${VLLM_ATTENTION_CONFIG:-}" ]] && args+=(--attention-config "$VLLM_ATTENTION_CONFIG")
+# prefill/TBT knob: when set, long prefills are yielded at this threshold
+[[ -n "${LONG_PREFILL_TOKEN_THRESHOLD:-}" && "${LONG_PREFILL_TOKEN_THRESHOLD}" != "0" ]] && args+=(--long-prefill-token-threshold "$LONG_PREFILL_TOKEN_THRESHOLD")
 [[ -n "${VLLM_COMPILATION_CONFIG:-}" ]] && args+=(--compilation-config "$VLLM_COMPILATION_CONFIG")
 [[ "$VLLM_ENFORCE_EAGER" == 1 ]] && args+=(--enforce-eager)
 [[ -n "${VLLM_OVERRIDE_GENERATION_CONFIG:-}" ]] && args+=(--override-generation-config "$VLLM_OVERRIDE_GENERATION_CONFIG")

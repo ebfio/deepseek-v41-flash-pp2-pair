@@ -11,19 +11,31 @@ NVIDIA tree (`vllm/models/deepseek_v41/nvidia/`).
 Under TP2, every decode step pays 84 all-reduces (~32% of the 12.3 ms step on
 this fabric). PP2 splits the 40 layers 20/20 across the two Grace-Blackwell
 systems and replaces the collectives with two point-to-point hops per step.
-The result, measured on this pair (2026-10-25):
+Under TP2 every decode step pays 84 all-reduces, ~32% of the 12.3 ms step on
+this fabric. PP2 splits the 40 layers 20/20 across the two Grace-Blackwell
+systems and replaces the collectives with two point-to-point hops per step.
 
-| Metric | TP2 (before) | PP2 (this recipe) |
+Measured on this pair. The PP2 column is the shipped config (boot
+B-double-prime, 2026-11-05); the TP2 column is the 2026-10-25 baseline and has
+not been re-measured on the current build.
+
+| Metric | TP2 (2026-10-25) | PP2 (this recipe, current) |
 | --- | --- | --- |
 | All-reduces per decode step | 84 | **0** |
-| Single-stream tok/s (identical temp-0 prompt) | 290.5 | **391** (+34%) |
-| Step time | 12.3 ms | ~9.4 ms |
-| Free KV cache (rank 0 / rank 1) | — | 72.7 / 57.1 GiB |
-| GSM8K 100-question slice (temp 0) | — | **97%** (97/100, 0 errors) |
+| Single-stream tok/s (identical temp-0 prompt) | 290.5 | **410.4** (+41%) |
+| Step time | 12.3 ms | **9.25 ms** |
+| KV cache pool | — | **70,529,814 tokens** (was 45.5M before the serving-config work) |
+| GSM8K | — | **0.965** (386/400, 95% CI 0.942-0.979) |
+
+Every PP2 figure above is reproducible from this repo: `verify/full_ab.py` for
+tok/s and step time (steps from the engine's own draft counters, never derived
+from tok/s), `verify/gsm8k_width.py` for the rate with an interval. The
+intermediate configs and what they cost are in "The serving config that won".
 
 **Where PP2 wins and where it may not:** PP2 is the single-stream shape. The
 pipeline needs scheduler admission depth to fill both stages — measured
-aggregate tok/s on this build: C1 323 · C2 406 · C4 595 · C8 974 (3.01 × C1).
+aggregate tok/s on this build (2026-10-25, pre-autotune): C1 323 · C2 406 ·
+C4 595 · C8 974 (3.01 × C1).
 TP2's step is batch-insensitive, so TP2 vs PP2 at C4–C16 is **not yet
 measured on this build** and TP2 may be the faster shape at higher
 concurrency; run the identical soak on both before committing a fan-out
@@ -88,7 +100,7 @@ is also the vision-encoder rank and the API rank, so it carries the most
 host memory pressure and should be the bigger-memory box if your pair is
 uneven. The draft's own embedding costs ~1.3 GB device memory on rank 1.
 Each decode step pays two point-to-point hops (hidden states down, drafts
-back), ~0.1–0.2 ms of the ~9.4 ms step.
+back), ~0.1–0.2 ms of the ~9.25 ms step.
 
 ## Layout
 
@@ -184,11 +196,16 @@ every boot re-tunes them.
   cross-rank collectives at all)
 - no world barrier; each rank saves its own tactics and proceeds
 
+`pp_autotune.py` v3 also skips profiling entirely when this config's cache
+loads (override with `VLLM_FLASHINFER_AUTOTUNE_FORCE_RETUNE=1`). Receipts: zero
+`Tuning` lines, `init engine` 111 s vs 591 s cold, boot ~8 min, md5 unchanged
+across the restart.
+
 Measured after adoption (2026-11-05, same prompts, temp 0):
 
 | metric | autotune off | autotune + overlay |
 |---|---|---|
-| C1 tok/s | 391 | **407.9** (+4.3%, 4 runs x 3 reps, spread 0.1%) |
+| C1 tok/s | 391 | **407.9** (+4.3%, 4 runs x 3 reps, spread 0.1%) *superseded by B-double-prime, 410.4* |
 | md5 (train prompt) | 616400039175 | cb6c80a8fb12 (x12 identical) |
 | completion tokens | 293 | 301 |
 | GSM8K | 97/100 | **99/100** |
@@ -209,6 +226,60 @@ next boot should skip tuning entirely (`tune_mode` only profiles missing keys).
    +1.51 GiB persistent on rank 1 (155.34 vs 153.83 GiB across three
    production boots). The fused kernel's fixed tile cost does not amortize at
    six tokens. Kept here as a negative result so it is not re-run.
+
+## The serving config that won (boot B-double-prime, 2026-11-05)
+
+Three settings, one at a time, measured on this pair. All C1 numbers are the
+train prompt at temp 0, 3 runs x 3 reps, steps counted from the engine's own
+draft counters (never derived from tok/s).
+
+| change | effect | verdict |
+|---|---|---|
+| `FLASHMLA_MEGA_ATTN_DSV41` + `fp8_ds_mla` | C1 364.4 vs 391 (-6.8%), KV -5.2%, +1.51 GiB persistent on rank 1 | rejected |
+| `num_speculative_tokens_per_batch_size` + pinned capture list | C1 384.0 vs 407.9 (-5.9%), acceptance 3.562 vs 3.73 | rejected |
+| `--max-num-batched-tokens 8192` + `--long-prefill-token-threshold 6144` | **KV 70,529,814 vs 45,521,213 (+55%)**, C1 flat, acceptance flat | **adopted** |
+| `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` | **KV +15.8% on top** (60.9M -> 70.5M), same acceptance | **adopted** |
+
+Production now runs `max-num-batched-tokens 8192`, `long-prefill-token-threshold
+6144`, default capture list, no k-schedule, and the profiler estimate off.
+
+**Why the profiler flag matters and what it costs.** `gpu_worker.py:707` logs
+that `--gpu-memory-utilization=0.9000 is equivalent to 0.8811` when the profiler
+is on: it measures a real activation peak and withholds it. Turning it off makes
+that a *guess*. Measured on this model, the guess is 9.5 GiB low on rank 1
+(11.83 GiB measured peak vs 2.34 GiB estimate), and that 9.5 GiB becomes KV
+cache. So the pool gain is real and the reserve it came from is not. Gate any
+further utilization increase behind a 1M-context prefill soak with
+`nvidia-smi` peak watched; do not stack `--gpu-memory-utilization 0.95` on top.
+
+**Warm boot.** `pp_autotune.py` now loads this config's cache and returns
+without profiling. Receipts from the drill: zero `Tuning` lines, `init engine`
+111 s vs 591 s cold, boot ~8 min, and the md5 is unchanged across the restart -
+which is the proof the loaded tactics are the ones serving.
+
+**Identity, corrected.** The cache file is keyed by the full `vllm_config` hash.
+Same hash reproduces the same md5 across boots (3/3 measured). A different hash
+is *expected* to produce a different md5; cross-config quality is GSM8K's job,
+not md5's. A "seed" env that loaded another config's tactics was tried and
+removed: it produced `0 new, N from previous` but the tune still re-benchmarked
+and re-selected, so the numerics did not follow the seed.
+
+**GSM8K on the adopted config.** 386/400 = 0.965 (95% CI 0.942-0.979) on
+q101-500, against 97/100 on the q1-100 gate - overlapping intervals, no
+regression. Five of the fourteen misses were `max_tokens` truncation at 4096;
+at 8192 they pass (q87 verified). Budget 8192, not 4096, for this reasoning
+model, or you will manufacture a ~1.25% phantom error rate.
+
+**Traps found the hard way.**
+1. `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` is spelled with an A. Misspell it
+   and vLLM logs `Unknown vLLM environment variable`, then profiles as usual -
+   a silent no-op.
+2. `--kv-cache-dtype` is resolved by the attention backend: under
+   `FLASHMLA_MEGA_ATTN_DSV41` an unspecific value becomes `nvfp4_ds_mla`, not
+   `fp8`. Spell `fp8_ds_mla` if you want the production KV format.
+3. The engine container has no `/models` mount. Any host path you pass in an
+   env var for use inside the container must be the container path
+   (`/root/.cache/...`), not the host one.
 
 ## Upstream
 
