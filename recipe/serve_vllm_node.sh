@@ -4,6 +4,15 @@
 set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$script_dir/config.env"
+# Knobs newer than the config.env a box may still carry (it is rendered by the role, not
+# copied from this repo). Under `set -u` a missing one aborts the launch, and a missing
+# default changes the lane without a word, so the launcher owns them. An older config.env
+# therefore launches the v0.31.0 lane exactly as before.
+: "${VLLM_OVERLAY_TAG:=v0.31.0}" "${VLLM_OVERLAY_GUARD:=enforce}" "${VLLM_PATCH_PP_AUTOTUNE:=0}"
+[[ "$VLLM_OVERLAY_TAG" == v0.31.0 ]] || : "${VLLM_CPU_DISTRIBUTED_TIMEOUT_S=7200}"
+: "${VLLM_CPU_DISTRIBUTED_TIMEOUT_S:=}" "${VLLM_SPEC_EXTRA:=}"
+: "${VLLM_STEERING_SIDECAR:=}" "${VLLM_STEERING_SHA256:=}" "${VLLM_STEERING_DEFAULT_SCALE:=0}" "${VLLM_STEERING_DEBUG:=0}"
+: "${VLLM_STEERING_REPLAY:=off}" "${VLLM_STEERING_KERNEL:=torch}"
 
 node_rank="${NODE_RANK:?Set NODE_RANK to 0 or 1}"
 case "$node_rank" in
@@ -25,7 +34,14 @@ case "$VLLM_PARALLEL" in
   *) echo "VLLM_PARALLEL must be pp or tp" >&2; exit 2 ;;
 esac
 
-cache_dir="$CACHE_ROOT/vllm-dsv41"
+case "$VLLM_OVERLAY_TAG" in
+  v0.31.0) cache_dir="$CACHE_ROOT/vllm-dsv41" ;;
+  # Every other tag gets its own caches: root-cache is seeded once from the image's
+  # /root/.cache (prebuilt FlashInfer JIT artifacts), so sharing it across images
+  # serves one image the other's seed, and it keeps the v0.31.0 caches intact for rollback.
+  v0.34.0) cache_dir="$CACHE_ROOT/vllm-dsv41-$VLLM_OVERLAY_TAG" ;;
+  *) echo "VLLM_OVERLAY_TAG must be v0.31.0 or v0.34.0" >&2; exit 2 ;;
+esac
 mkdir -p "$cache_dir"/{root-cache,triton,tilelang,nv} "$script_dir/logs"
 # Seed the persistent cache from the image's own /root/.cache (prebuilt FlashInfer JIT artifacts) on first use.
 if [[ ! -e "$cache_dir/root-cache/.seeded" ]]; then
@@ -38,7 +54,11 @@ docker_env=(
   # mid-tune. Paired with VLLM_PATCH_PP_AUTOTUNE=1 (see README).
   --env "VLLM_ENGINE_READY_TIMEOUT_S=7200"
   --env "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=$VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"
-  --env "VLLM_PATCH_PP_AUTOTUNE=$VLLM_PATCH_PP_AUTOTUNE"
+)
+# v0.31.0 only. Upstream tunes per PP stage since 0.33, and pp_autotune.py calls
+# kernel_warmup names that 0.34.0 no longer has, so the hook is not shipped there.
+[[ "$VLLM_OVERLAY_TAG" == v0.31.0 ]] && docker_env+=(--env "VLLM_PATCH_PP_AUTOTUNE=$VLLM_PATCH_PP_AUTOTUNE")
+docker_env+=(
   --env "VLLM_USE_RUST_FRONTEND=$VLLM_RUST_FRONTEND"
   --env "VLLM_ALLREDUCE_USE_SYMM_MEM=0"
   --env "VLLM_ALLREDUCE_USE_FLASHINFER=0"
@@ -88,26 +108,114 @@ fi
 # PP2 one-liner flag overlay (patches/vllm-pp2-flag/README.md): the ClassVar
 # flip only; the 5-file port (dsv41_pp2_dspark) is the fallback, never both.
 if [[ "${VLLM_PATCH_PP2_FLAG:-0}" == 1 ]]; then
-  [[ -s "$script_dir/patches/vllm-pp2-flag/sitecustomize.py" ]] || { echo "missing patches/vllm-pp2-flag/sitecustomize.py" >&2; exit 1; }
-  extra_mounts+=(--volume "$script_dir/patches/vllm-pp2-flag:/opt/pp2-flag:ro")
+  site_pkgs=/usr/local/lib/python3.12/dist-packages
+  # The whole-file overlays are copies of one vLLM tag's sources plus small edits,
+  # so each set names the files it replaces and may only be mounted on that tag.
+  case "$VLLM_OVERLAY_TAG" in
+    v0.31.0)
+      # Mainline-aligned PP2+DSpark increments (2026-10-25): the ClassVar
+      # flip (sitecustomize) + draft-own-embed (dspark.py) + keep input_ids on
+      # non-first PP ranks for vision MoE routing (model_runner.py,
+      # cudagraph_utils.py) + KV-group filtering under PP (kv_cache_utils.py:
+      # without it, allocate_kv_cache raises StopIteration on a PP rank that
+      # owns none of a group's layers; receipt 2026-10-25 attempt 4).
+      overlay_dir="$script_dir/patches/vllm-pp2-flag"
+      overlay_files=(
+        "dspark.py:vllm/models/deepseek_v41/nvidia/dspark.py"
+        "model_runner.py:vllm/v1/worker/gpu/model_runner.py"
+        "cudagraph_utils.py:vllm/v1/worker/gpu/cudagraph_utils.py"
+        "kv_cache_utils.py:vllm/v1/core/kv_cache_utils.py"
+      ) ;;
+    v0.34.0)
+      # The input_ids gate (since 0.33) and the KV-group filter (0.34, now in
+      # kv_cache_planning.py) are upstream. Only the flag flip and the
+      # draft-own-embed file are left; see patches/vllm-pp2-flag-v034/README.md.
+      overlay_dir="$script_dir/patches/vllm-pp2-flag-v034"
+      overlay_files=("dspark.py:vllm/models/deepseek_v41/nvidia/dspark.py")
+      if [[ "${VLLM_PATCH_PP_AUTOTUNE:-0}" == 1 ]]; then
+        echo "VLLM_PATCH_PP_AUTOTUNE=1 is v0.31.0-only: 0.34.0 tunes per PP stage itself and the overlay would crash warmup. Unset it." >&2
+        exit 2
+      fi ;;
+  esac
+  [[ -s "$overlay_dir/sitecustomize.py" ]] || { echo "missing $overlay_dir/sitecustomize.py" >&2; exit 1; }
+  extra_mounts+=(--volume "$overlay_dir:/opt/pp2-flag:ro")
   docker_env+=(--env "PYTHONPATH=/opt/pp2-flag")
-  # Mainline-aligned PP2+DSpark increments (2026-10-25): the ClassVar
-  # flip (sitecustomize) + draft-own-embed (dspark.py) + keep input_ids on
-  # non-first PP ranks for vision MoE routing (model_runner.py,
-  # cudagraph_utils.py). All three overlays are v0.31.0 sources + small edits;
-  # the 5-file port is discarded (doubly stale for this image).
-  [[ -s "$script_dir/patches/vllm-pp2-flag/dspark.py" ]] || { echo "missing patches/vllm-pp2-flag/dspark.py" >&2; exit 1; }
-  extra_mounts+=(--volume "$script_dir/patches/vllm-pp2-flag/dspark.py:/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41/nvidia/dspark.py:ro")
-  [[ -s "$script_dir/patches/vllm-pp2-flag/model_runner.py" ]] || { echo "missing patches/vllm-pp2-flag/model_runner.py" >&2; exit 1; }
-  extra_mounts+=(--volume "$script_dir/patches/vllm-pp2-flag/model_runner.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py:ro")
-  [[ -s "$script_dir/patches/vllm-pp2-flag/cudagraph_utils.py" ]] || { echo "missing patches/vllm-pp2-flag/cudagraph_utils.py" >&2; exit 1; }
-  extra_mounts+=(--volume "$script_dir/patches/vllm-pp2-flag/cudagraph_utils.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/cudagraph_utils.py:ro")
-  # KV-group filtering under PP (the fork's base patch, re-based to v0.31.0;
-  # applies clean, offset 63): without it, allocate_kv_cache raises
-  # StopIteration on a PP rank that owns none of a group's layers
-  # (receipt 2026-10-25 attempt 4, worker/utils.py:432).
-  [[ -s "$script_dir/patches/vllm-pp2-flag/kv_cache_utils.py" ]] || { echo "missing patches/vllm-pp2-flag/kv_cache_utils.py" >&2; exit 1; }
-  extra_mounts+=(--volume "$script_dir/patches/vllm-pp2-flag/kv_cache_utils.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_utils.py:ro")
+  for spec in "${overlay_files[@]}"; do
+    src="$overlay_dir/${spec%%:*}"; rel="${spec#*:}"
+    [[ -s "$src" ]] || { echo "missing $src" >&2; exit 1; }
+    # A set that ships PRISTINE.sha256 only replaces the exact file it was cut from.
+    if [[ -s "$overlay_dir/PRISTINE.sha256" ]]; then
+      want="$(awk -v f="$rel" '$2 == f {print $1}' "$overlay_dir/PRISTINE.sha256")"
+      # A probe that fails (file absent in the image, docker error) counts as a mismatch.
+      got="$(docker run --rm --entrypoint sha256sum "$VLLM_IMAGE" "$site_pkgs/$rel" 2>/dev/null | awk '{print $1}' || true)"
+      if [[ -z "$want" || "$want" != "$got" ]]; then
+        echo "$VLLM_IMAGE: $rel is not the $VLLM_OVERLAY_TAG file this overlay was cut from (want ${want:-<unlisted>}, got ${got:-<none>})." >&2
+        [[ "${VLLM_OVERLAY_GUARD:-enforce}" == warn ]] || { echo "Refusing to mount it (VLLM_OVERLAY_GUARD=warn overrides)." >&2; exit 1; }
+      fi
+    fi
+    extra_mounts+=(--volume "$src:$site_pkgs/$rel:ro")
+  done
+fi
+# Per-request activation steering (patches/pp2-steering/README.md). The module is loaded by
+# the v0.34.0 overlay's sitecustomize, in every Python process of the container, and ends the
+# process if it cannot install. Nothing below runs, and nothing is mounted, while the sidecar
+# knob is empty.
+if [[ -n "${VLLM_STEERING_SIDECAR:-}" ]]; then
+  steer_dir="$script_dir/patches/pp2-steering"
+  steer_refuse() { echo "steering: $*. Refusing to launch." >&2; exit 2; }
+  [[ "$VLLM_OVERLAY_TAG" == v0.34.0 ]] || steer_refuse "wired into the v0.34.0 lane only (VLLM_OVERLAY_TAG=$VLLM_OVERLAY_TAG)"
+  [[ "$VLLM_PARALLEL" == pp && "${VLLM_PATCH_PP2_FLAG:-0}" == 1 ]] || steer_refuse "needs VLLM_PARALLEL=pp and VLLM_PATCH_PP2_FLAG=1 (that overlay's sitecustomize loads the module)"
+  [[ "${VLLM_PATCH_GRAPH_ATTR:-0}" != 1 ]] || steer_refuse "VLLM_PATCH_GRAPH_ATTR=1 replaces PYTHONPATH, so the module would never load"
+  [[ "$VLLM_RUST_FRONTEND" == 0 ]] || steer_refuse "not validated with the Rust frontend (VLLM_RUST_FRONTEND=$VLLM_RUST_FRONTEND)"
+  # Steering edits activations of the stock model. A stage that loads an already abliterated
+  # checkpoint is edited twice at scale 1 and is not stock at scale 0, and nothing would say so.
+  [[ "$MODEL_DIR_RANK0" == "$MODEL_DIR_RANK1" ]] || steer_refuse "both stages must load the same stock checkpoint (MODEL_DIR_RANK0=$MODEL_DIR_RANK0, MODEL_DIR_RANK1=$MODEL_DIR_RANK1)"
+  [[ -s "$steer_dir/pp2_steering.py" ]] || steer_refuse "missing $steer_dir/pp2_steering.py"
+  # docker reads a --volume source that does not start with a slash as the NAME of a
+  # volume: it creates one and mounts an empty directory, and the checks below, which run
+  # here on the host, pass all the same (2026-11-20: the engine died on IsADirectoryError).
+  # So the path is made absolute once, before anything reads it. A relative path is taken
+  # from this script's directory, where config.env lives: the same file on both nodes
+  # whatever the caller's working directory.
+  [[ "$VLLM_STEERING_SIDECAR" == /* ]] || VLLM_STEERING_SIDECAR="$script_dir/$VLLM_STEERING_SIDECAR"
+  [[ -f "$VLLM_STEERING_SIDECAR" && -s "$VLLM_STEERING_SIDECAR" ]] || steer_refuse "no sidecar file at $VLLM_STEERING_SIDECAR on $(hostname)"
+  VLLM_STEERING_SIDECAR="$(realpath -e -- "$VLLM_STEERING_SIDECAR")"
+  [[ "${VLLM_STEERING_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || steer_refuse "VLLM_STEERING_SHA256 must be the sidecar's sha256 (64 lowercase hex)"
+  steer_got="$(sha256sum "$VLLM_STEERING_SIDECAR" | awk '{print $1}')"
+  [[ "$steer_got" == "$VLLM_STEERING_SHA256" ]] || steer_refuse "sidecar on $(hostname) has sha256 $steer_got, expected $VLLM_STEERING_SHA256"
+  [[ "${VLLM_STEERING_DEFAULT_SCALE:-0}" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || steer_refuse "VLLM_STEERING_DEFAULT_SCALE must be a number in [0, 1]"
+  [[ "${VLLM_STEERING_DEBUG:-0}" =~ ^[01]$ ]] || steer_refuse "VLLM_STEERING_DEBUG must be 0 or 1"
+  [[ "$VLLM_STEERING_REPLAY" =~ ^(off|keep)$ ]] || steer_refuse "VLLM_STEERING_REPLAY must be off or keep"
+  [[ "$VLLM_STEERING_KERNEL" =~ ^(torch|fused)$ ]] || steer_refuse "VLLM_STEERING_KERNEL must be torch or fused"
+  [[ "$VLLM_STEERING_KERNEL" == torch || -s "$steer_dir/pp2_steering_kernel.py" ]] || steer_refuse "VLLM_STEERING_KERNEL=fused needs $steer_dir/pp2_steering_kernel.py"
+  # Does the module staged here read the sidecar staged here? The module answers that
+  # when the model is built, minutes into a boot (2026-11-20: a tracer sidecar next to
+  # revision 2's module, which reads only the published format, cost a nine-minute boot
+  # and a rollback). stage_check.py answers it now from the two files, and refuses only
+  # what the module would refuse. Skipped on a host without python3.
+  if [[ -s "$steer_dir/stage_check.py" ]] && command -v python3 >/dev/null 2>&1; then
+    steer_allow=0
+    while IFS='=' read -r k v; do
+      if [[ "$k" == PP2_STEERING_ALLOW_UNVERIFIED && "$v" == 1 ]]; then steer_allow=1; fi
+    done <<<"${EXTRA_ENV:-}"
+    steer_said="$(PP2_STEERING_ALLOW_UNVERIFIED="$steer_allow" python3 -B "$steer_dir/stage_check.py" --module "$steer_dir/pp2_steering.py" --sidecar "$VLLM_STEERING_SIDECAR" 2>&1)" \
+      || steer_refuse "on $(hostname): ${steer_said:-stage_check.py did not run}"
+    echo "steering: $steer_said" >&2
+  fi
+  extra_mounts+=(
+    --volume "$steer_dir:/opt/pp2-steering:ro"
+    --volume "$VLLM_STEERING_SIDECAR:/opt/pp2-steering-sidecar/steering.safetensors:ro"
+  )
+  docker_env+=(
+    --env "PP2_STEERING_SIDECAR=/opt/pp2-steering-sidecar/steering.safetensors"
+    --env "PP2_STEERING_SHA256=$VLLM_STEERING_SHA256"
+    --env "PP2_STEERING_DEFAULT_SCALE=${VLLM_STEERING_DEFAULT_SCALE:-0}"
+    --env "PP2_STEERING_DEBUG=${VLLM_STEERING_DEBUG:-0}"
+  )
+  # Passed only when they leave the default, so a launch that sets neither is the
+  # command line it was before these two knobs existed.
+  [[ "$VLLM_STEERING_REPLAY" == off ]] || docker_env+=(--env "PP2_STEERING_REPLAY=$VLLM_STEERING_REPLAY")
+  [[ "$VLLM_STEERING_KERNEL" == torch ]] || docker_env+=(--env "PP2_STEERING_KERNEL=$VLLM_STEERING_KERNEL")
 fi
 # One-shot 2-rank all-reduce overlay (patches/vllm-oneshot-ar/README.md).
 # Flip only after the nccl-tests allgather-vs-allreduce bracket passes on this fabric.
@@ -153,6 +261,10 @@ args=(
 [[ "$VLLM_ENFORCE_EAGER" == 1 ]] && args+=(--enforce-eager)
 [[ -n "${VLLM_OVERRIDE_GENERATION_CONFIG:-}" ]] && args+=(--override-generation-config "$VLLM_OVERRIDE_GENERATION_CONFIG")
 [[ -n "${VLLM_DEFAULT_CHAT_TEMPLATE_KWARGS:-}" ]] && args+=(--default-chat-template-kwargs "$VLLM_DEFAULT_CHAT_TEMPLATE_KWARGS")
+# gloo group timeout (default 1800 s). A cold autotune ends in a world barrier, and
+# the rank that finishes first waits there for the rest of the other stage's tune.
+# The value feeds the config hash that names the autotune cache directory.
+[[ -n "${VLLM_CPU_DISTRIBUTED_TIMEOUT_S:-}" ]] && args+=(--cpu-distributed-timeout-seconds "$VLLM_CPU_DISTRIBUTED_TIMEOUT_S")
 case "$MODE" in
   throughput) ;;
   low-latency)
@@ -177,12 +289,25 @@ case "$MODE" in
         exit 2
       fi
     fi
-    args+=(--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":${VLLM_DSPEC_TOKENS:-5},\"draft_sample_method\":\"${VLLM_DRAFT_SAMPLE_METHOD:-probabilistic}\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":$adaptive}") ;;
+    # VLLM_SPEC_EXTRA: extra speculative-config keys as a JSON fragment without braces, e.g.
+    #   "draft_lm_head_quantization":"fp8"   or   "num_speculative_tokens_per_batch_size":[[1,4,5],[5,7,4],[8,128,3]]
+    # so a draft-side experiment is a config change on both ranks, not a script edit on one.
+    args+=(--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":${VLLM_DSPEC_TOKENS:-5},\"draft_sample_method\":\"${VLLM_DRAFT_SAMPLE_METHOD:-probabilistic}\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":$adaptive${VLLM_SPEC_EXTRA:+,$VLLM_SPEC_EXTRA}}") ;;
   *) echo "MODE must be throughput or low-latency" >&2; exit 2 ;;
 esac
 # shellcheck disable=SC2206
 [[ -n "$EXTRA_ARGS" ]] && args+=($EXTRA_ARGS)
 if [[ "$node_rank" == 0 ]]; then args+=(--host "$API_HOST" --port "$API_PORT"); else args+=(--headless); fi
+
+# A --volume source without a leading slash is a volume name to docker, not a path.
+for ((i = 0; i + 1 < ${#extra_mounts[@]}; i++)); do
+  [[ "${extra_mounts[i]}" == --volume ]] || continue
+  mount_src="${extra_mounts[i + 1]%%:*}"
+  [[ "$mount_src" == /* ]] || { echo "Refusing to launch: --volume source '$mount_src' is not an absolute path; docker would create a volume of that name and mount an empty directory." >&2; exit 2; }
+done
+for mount_src in "$model_dir" "$cache_dir"; do
+  [[ "$mount_src" == /* ]] || { echo "Refusing to launch: '$mount_src' is not an absolute path; docker would create a volume of that name." >&2; exit 2; }
+done
 
 docker run --detach \
   --name "$CONTAINER_NAME" \

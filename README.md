@@ -281,6 +281,112 @@ model, or you will manufacture a ~1.25% phantom error rate.
    env var for use inside the container must be the container path
    (`/root/.cache/...`), not the host one.
 
+## vLLM v0.34.0, and per-request abliteration from stock weights
+
+Measured on the same pair, 2026-11-20/21. Two changes on top of the v0.31.0 lane above:
+the engine moves to v0.34.0, and the model gains a **runtime** abliteration direction that
+a request can switch on. Both were measured, not asserted.
+
+### The overlay set shrinks on 0.34.0
+
+Three of the five v0.31.0 overlays are upstream and are dropped: `model_runner.py`,
+`cudagraph_utils.py`, and `kv_cache_utils.py` (that one landed in 0.34.0 only, at
+`vllm/v1/core/kv_cache_planning.py:741-743`). `dspark.py` stays, rebased onto the tag.
+`sitecustomize.py` stays. `pp_autotune.py` is dead on this tag — the launcher refuses
+`VLLM_PATCH_PP_AUTOTUNE=1` on 0.34.0 by design, because the world-barrier fix it carried
+is upstream now. `VLLM_OVERLAY_TAG` selects the set; the v0.31.0 lane stays launchable
+with its own overlay directory, image digest and cache untouched.
+
+### v0.34.0 cannot boot a stage that begins at the last KV source layer
+
+Found the hard way: rank 1 (layers 20-39) died on its first forward with
+`RuntimeError: Worker failed with error ''` and no traceback on rank 0.
+
+```
+DeepSeek-V4.1-Flash-1017 config.json:  text_config.kv_source_layer_ids = [2, 8, 14, 20]
+rank 1                                 layers 20-39  →  starts exactly at cut = 20
+vllm/models/deepseek_v41/nvidia/model.py:1332   the check refuses start_layer > cut,
+                                                so equality passes
+vllm/models/deepseek_v41/nvidia/model.py:1120   the pre-replay layer range is empty
+vllm/models/deepseek_v41/nvidia/model.py:1247   assert residual is not None and post_mix is not None
+```
+
+`20/20` is vLLM's own default split for 40 layers at PP=2 (`vllm/distributed/utils.py:240`),
+so this is not a quirk of this recipe. `sitecustomize.py` wraps `_decoder_replay_supported`
+and answers "not supported" for a stage that begins at the cut; `VLLM_PATCH_PP_REPLAY_BOUNDARY=0`
+removes the guard. Rank 1 then prints one line naming the layer and the reason.
+
+### Abliteration at runtime, from one stock checkpoint
+
+Stock weights on both stages; a 684 KB sidecar supplies a direction and a per-row gain per
+steered layer, and a forward hook applies `x' = x - s·alpha·(x·d)d` with `s` the request's
+`steering_scale`. `s = 0` (or no field) is stock; `s = 1` is the abliterated direction.
+Both stages must load the same stock checkpoint — the launcher refuses otherwise, because a
+stage loading an already-abliterated tree would be edited twice at 1 and would not be stock
+at 0.
+
+Sidecar: `jcartu/WARMIND-1017-Steering-Sidecar` revision `1bf69d8f`, 684,060 B, sha256
+`68551f9b8deca315d0c23f31519f69e240d0d4bf0459676add70762635d86a2d`, MIT, 99 tensors, no
+model weights. Pass it as an **absolute path**: `serve_vllm_node.sh` hands it straight to
+`docker -v`, and docker treats a relative source as a *named volume* — it creates the volume
+and mounts a directory, so the module dies with `IsADirectoryError` after every host-side
+check has passed. The launcher now absolutises it.
+
+### What it costs and what it gives
+
+`decode_rate.py --train-prompt --tokens 512`, median of 3, C1 within 0.1%, cold prefill:
+
+| | C1 tok/s | tokens/round | ms/round |
+|---|---|---|---|
+| v0.31.0, shipped lane | 410.4 | 3.80 | 9.25 |
+| v0.34.0, **no module** | 429.1 | 3.69 | 8.58 |
+| v0.34.0, **+ steering** | 376.9 | 3.69 | 9.76 |
+
+The engine upgrade is a gain (+4.6% C1, faster rounds). The module costs 12.1% of C1 and
+**all of it is step time** — tokens/round is identical, so the drafter is untouched. The
+cost is paid per step, so a steered request is not slower than a vanilla one on the same
+lane. KV: 62,361,328 tokens (59.47× at 1,048,576 per request). `VLLM_STEERING_KERNEL=fused`
+cuts the hooks from 224/238 kernels per forward to 32/34 and is the obvious next step.
+
+### Verification: what a probe can and cannot decide
+
+`verify/steering_probe.py` runs seven behavioural tests on a live lane. On this
+configuration: T1 (three spellings of scale 0 agree), T2 (scale 1 moves the output),
+T3 (scale is a dial), T1b (scale 0 equals a lane booted without the module), T4 (mixed-scale
+batches do not cross), T6 (the prefix cache does not leak across scales), T7 (validation)
+all pass. T4 needed four instruments:
+
+- Revision 1-2 compared whole responses; this lane's batch effect (0.38) is larger than the
+  operator's effect (0.09 min), so it could not separate them.
+- `--t4-tokens 24` broke T2 twenty seconds after T2 passed — unusable here.
+- A tracer sidecar (gain 1/64) made scale 1 degenerate, which broke T2's precondition.
+- The decisive defect was in the metric: revisions up to 4 compared only tokens named in
+  *both* top-20 lists, so a list that loses its leading token reads as distance ≈ 0. A
+  tracer that replaces the leading token measured 0.008 while the text differed 4/4.
+  Revision 5 measures what the two lists prove and decides it: 621 positions screened, 216
+  differ by ≥0.2, and off-own positions are no more frequent in mixed bursts than in
+  single-scale ones (46/384 vs 59/420 at scale 0, 63/416 vs 47/413 at scale 1; smallest
+  p = 0.0673 against a FAIL bar of 0.00025; 0 and 1 swaps respectively).
+
+**T5** (each stage steers on its own) needs `VLLM_STEERING_DEBUG=1` and `--debug-ranks`;
+**T8** (decode vs prefill) stayed inconclusive.
+
+### Serving both from one lane (litellm)
+
+One engine, two ids: the plain id with no body field, and a second alias carrying
+`extra_body: {steering_scale: 1.0}`. Two traps, both silent:
+
+1. **The alias must send the engine's own model name.** vLLM validates the request's
+   `model` field (flare does not), so an alias whose public name differs from the served
+   name needs an explicit `model_id` in the litellm deployment.
+2. **A `dsv41_chronarion` block renders two deployments** — `<name>@<host>`, which carries
+   `extra_body`, and a public group from the affinity loop, which does not. Requests land on
+   the public group, so the steering body is dropped and the alias serves vanilla under a
+   steered name. Give the steered alias a single-deployment backend.
+
+Verified at temperature 0 on a refusal prompt: the plain id answers "I can't provide
+instructions for picking locks", the steered id answers "Insert a tension wrench".
+
 ## Upstream
 
 Three changes belong in vLLM proper, in this order (links to follow):

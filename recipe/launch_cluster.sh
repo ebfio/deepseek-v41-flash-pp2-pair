@@ -15,6 +15,9 @@ wait_ready="${WAIT_READY_SECONDS:-3600}"
 rsync -a --exclude cache --exclude models --exclude hostrdma --exclude results --exclude logs --exclude '.*' "$script_dir/" "$RANK1_SSH:$script_dir/"
 
 # Pass every overridable knob through to the remote rank explicitly (SWAP_APPLIED keeps config.env from swapping twice).
+# A knob serve_vllm_node.sh reads that is missing here reaches this host only: the remote rank silently runs the
+# config.env default. The drafter lives on the last stage, so that turns an A/B into two different servers.
+# (VLLM_ATTENTION_CONFIG and VLLM_DEFAULT_CHAT_TEMPLATE_KWARGS are hard-assigned in config.env on both nodes.)
 pass=()
 for v in ENGINE SWAP_RANKS SWAP_APPLIED IMAGE VLLM_IMAGE CONTAINER_NAME SERVED_MODEL_NAME RANK0_IP RANK1_IP RANK1_RAIL1_IP MASTER_PORT API_PORT API_HOST \
          FABRIC_IFACE NCCL_HCAS NCCL_TUNING \
@@ -24,7 +27,13 @@ for v in ENGINE SWAP_RANKS SWAP_APPLIED IMAGE VLLM_IMAGE CONTAINER_NAME SERVED_M
          LANGUAGE_MODEL_ONLY DISABLE_OVERLAP ALLREDUCE_FUSION HOST_RDMA HOST_RDMA_DIR NCCL_DEBUG_SUBSYS EXTRA_ARGS EXTRA_ENV \
          VLLM_PARALLEL VLLM_PP_LAYER_PARTITION VLLM_GPU_MEMORY_UTILIZATION VLLM_LANGUAGE_MODEL_ONLY VLLM_PREFIX_CACHING \
          VLLM_FLASHINFER_AUTOTUNE VLLM_ASYNC_SCHEDULING VLLM_KV_CACHE_DTYPE VLLM_COMPILATION_CONFIG VLLM_ENFORCE_EAGER VLLM_RUST_FRONTEND \
-         VLLM_MASTER_PORT VLLM_DEEP_GEMM_WARMUP VLLM_PATCH_PP VLLM_PATCH_PP_DSPARK; do
+         VLLM_MASTER_PORT VLLM_DEEP_GEMM_WARMUP VLLM_PATCH_PP VLLM_PATCH_PP_DSPARK \
+         VLLM_OVERLAY_TAG VLLM_OVERLAY_GUARD VLLM_PATCH_PP2_FLAG VLLM_PATCH_PP_AUTOTUNE VLLM_CPU_DISTRIBUTED_TIMEOUT_S \
+         VLLM_DSPEC_TOKENS VLLM_SPEC_EXTRA VLLM_DRAFT_SAMPLE_METHOD VLLM_ADAPTIVE_VERIFICATION VLLM_OVERRIDE_GENERATION_CONFIG \
+         VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS LONG_PREFILL_TOKEN_THRESHOLD ENGRAM_THP \
+         VLLM_PATCH_ONESHOT_AR VLLM_PATCH_GRAPH_ATTR \
+         VLLM_STEERING_SIDECAR VLLM_STEERING_SHA256 VLLM_STEERING_DEFAULT_SCALE VLLM_STEERING_DEBUG \
+         VLLM_STEERING_REPLAY VLLM_STEERING_KERNEL; do
   pass+=("$v=$(printf '%q' "${!v:-}")")
 done
 
@@ -42,22 +51,44 @@ nohup docker logs -f "$CONTAINER_NAME" > "logs/live-rank$local_rank-$live_ts.log
 ssh -n -f -o BatchMode=yes "$RANK1_SSH" "cd $script_dir && mkdir -p logs && setsid nohup docker logs -f $CONTAINER_NAME > logs/live-rank$remote_rank-$live_ts.log 2>&1 < /dev/null &" || true
 echo "== live logs: logs/live-rank$local_rank-$live_ts.log (remote: logs/live-rank$remote_rank-$live_ts.log)"
 
+# What a failed launch shows of one rank's log: from its first traceback on, else its tail.
+# The engine core reports only the TEXT of a worker's exception ("Worker failed with error
+# '...'"); the traceback is in that worker's own log, which for the remote rank is on the
+# remote node. An exception without a message (a bare assert) arrives as ''.
+log_excerpt_cmd() {
+  printf 'f=%q; echo "--- $(hostname): $f"; n=$(grep -n "Traceback (most recent call last)" "$f" 2>/dev/null | head -1 | cut -d: -f1); if [ -n "$n" ]; then [ "$n" -gt 3 ] && n=$((n - 3)); tail -n "+$n" "$f" | grep -vE "ncclIb|NCCL INFO" | head -80; else grep -vE "ncclIb|NCCL INFO" "$f" 2>/dev/null | tail -40; fi' "$1"
+}
+
 echo "== waiting for $API_URL/health (up to ${wait_ready}s); follow with ./logs.sh 0 | ./logs.sh 1"
 start=$SECONDS
 while (( SECONDS - start < wait_ready )); do
   if curl -fsS --max-time 3 "$API_URL/health" >/dev/null 2>&1; then
     echo "READY after $((SECONDS - start))s"
     { if [[ $local_rank == 0 ]]; then docker logs "$CONTAINER_NAME" 2>&1; else ssh -o BatchMode=yes "$RANK1_SSH" "docker logs $CONTAINER_NAME 2>&1"; fi; } | grep -iE "attention.backend|moe.runner|fp8.gemm|kv cache|mem_fraction|max_total_num_tokens|engram|huge pages|capture cuda graph end|load weight end|allreduce fusion|Maximum concurrency|GPU KV cache size|Loading weights took|graph capturing finished|Data Direct|GDRDMA" | tail -24
+    if [[ -n "${VLLM_STEERING_SIDECAR:-}" ]]; then
+      # Each stage logs one line when its hooks are in. A stage without it serves every request
+      # stock, whatever steering_scale says, and /health cannot tell.
+      for r in $local_rank $remote_rank; do
+        steer_line="[pp2_steering] rank $r: steering layers"
+        if [[ $r == $local_rank ]]; then steer_n="$( { docker logs "$CONTAINER_NAME" 2>&1 || true; } | grep -cF "$steer_line" || true)"
+        else steer_n="$( { ssh -o BatchMode=yes "$RANK1_SSH" "docker logs $CONTAINER_NAME 2>&1" || true; } | grep -cF "$steer_line" || true)"; fi
+        if [[ "${steer_n:-0}" -lt 1 ]]; then
+          echo "READY, but rank $r never logged '$steer_line': steering is NOT live on that stage. Stop the cluster before it takes traffic." >&2
+          exit 3
+        fi
+      done
+      echo "steering: hooks reported on both ranks; verify/steering_probe.py is the functional check"
+    fi
     exit 0
   fi
   for r in $local_rank $remote_rank; do
     if [[ $r == $local_rank ]]; then st="$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo missing)"
     else st="$(ssh -o BatchMode=yes "$RANK1_SSH" docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo missing)"; fi
     if [[ "$st" != running ]]; then
-      echo "rank $r container is '$st' - launch failed; last log lines:" >&2
+      echo "rank $r container is '$st' - launch failed. Both ranks' logs follow: the rank that stopped first is not always the one that failed." >&2
       sleep 2
-      if [[ $r == $local_rank ]]; then grep -vE "ncclIb|NCCL INFO" "logs/live-rank$local_rank-$live_ts.log" | tail -40 >&2
-      else ssh -o BatchMode=yes "$RANK1_SSH" "grep -vE 'ncclIb|NCCL INFO' $script_dir/logs/live-rank$remote_rank-$live_ts.log | tail -40" >&2; fi
+      bash -c "$(log_excerpt_cmd "$script_dir/logs/live-rank$local_rank-$live_ts.log")" >&2 || true
+      ssh -o BatchMode=yes "$RANK1_SSH" "$(log_excerpt_cmd "$script_dir/logs/live-rank$remote_rank-$live_ts.log")" >&2 || true
       exit 1
     fi
   done

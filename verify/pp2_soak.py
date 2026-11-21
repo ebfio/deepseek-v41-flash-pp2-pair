@@ -10,7 +10,16 @@ import subprocess
 import time
 import urllib.request
 
-src = open("/tmp/accept_sweep.py").read()
+import os
+import sys
+
+# The corpus and the references used to be /tmp/accept_sweep.py and /tmp/tp2_refs.json,
+# which were never committed. Both now live next to this script; see verify/corpus.py.
+HERE = os.path.dirname(os.path.abspath(__file__))
+CORPUS = os.environ.get("PP2_CORPUS", os.path.join(HERE, "corpus.py"))
+URL = os.environ.get("PP2_URL", "http://127.0.0.1:8001").rstrip("/")
+MODEL = os.environ.get("PP2_MODEL", "deepseek-v4.1-flash")
+src = open(CORPUS).read()
 ns = {}
 exec(compile(src.split("COMBOS")[0], "corpus", "exec"), ns)
 CLASSES = ns["CLASSES"]
@@ -22,7 +31,7 @@ PROMPTS = [p for ps in CLASSES.values() for p in ps]
 def one(prompt, max_tokens=512):
     body = json.dumps(
         {
-            "model": "deepseek-v4.1-flash",
+            "model": MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "temperature": 0.7,
@@ -31,7 +40,7 @@ def one(prompt, max_tokens=512):
     ).encode()
     r = urllib.request.urlopen(
         urllib.request.Request(
-            "http://127.0.0.1:8001/v1/chat/completions",
+            URL + "/v1/chat/completions",
             body,
             {"Content-Type": "application/json"},
         ),

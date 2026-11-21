@@ -7,19 +7,34 @@ import json
 import time
 import urllib.request
 
-src = open("/tmp/accept_sweep.py").read()
+import os
+import sys
+
+# The corpus and the references used to be /tmp/accept_sweep.py and /tmp/tp2_refs.json,
+# which were never committed. Both now live next to this script; see verify/corpus.py.
+HERE = os.path.dirname(os.path.abspath(__file__))
+CORPUS = os.environ.get("PP2_CORPUS", os.path.join(HERE, "corpus.py"))
+URL = os.environ.get("PP2_URL", "http://127.0.0.1:8001").rstrip("/")
+MODEL = os.environ.get("PP2_MODEL", "deepseek-v4.1-flash")
+src = open(CORPUS).read()
 ns = {}
 exec(compile(src.split("COMBOS")[0], "corpus", "exec"), ns)
 CLASSES = ns["CLASSES"]
 SEP = "\n<<<SPLIT>>>\n"
 EMPTY = hashlib.md5(SEP.encode()).hexdigest()[:12]
-refs = {(c, i): (h, n) for c, i, h, n in json.load(open("/tmp/tp2_refs.json"))}
+# PP2_REFS: the reference file ([class, index, md5, tokens] rows). PP2_RECORD_REFS=1 writes
+# it from this lane instead of comparing against it. Without a file, parity is unmeasured.
+REFS = os.environ.get("PP2_REFS", os.path.join(HERE, "refs", "parity_refs.json"))
+RECORD = os.environ.get("PP2_RECORD_REFS", "") == "1"
+refs = {}
+if not RECORD and os.path.exists(REFS):
+    refs = {(c, i): (h, n) for c, i, h, n in json.load(open(REFS))}
 
 
 def one(prompt, max_tokens=1536):
     body = json.dumps(
         {
-            "model": "deepseek-v4.1-flash",
+            "model": MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "temperature": 0,
@@ -29,7 +44,7 @@ def one(prompt, max_tokens=1536):
     t0 = time.time()
     r = urllib.request.urlopen(
         urllib.request.Request(
-            "http://127.0.0.1:8001/v1/chat/completions",
+            URL + "/v1/chat/completions",
             body,
             {"Content-Type": "application/json"},
         ),
@@ -47,7 +62,7 @@ def one(prompt, max_tokens=1536):
 
 
 def spec_counters():
-    with urllib.request.urlopen("http://127.0.0.1:8001/metrics", timeout=10) as r:
+    with urllib.request.urlopen(URL + "/metrics", timeout=10) as r:
         text = r.read().decode()
     drafts = accepted = 0.0
     steps = None
@@ -86,6 +101,10 @@ for cls, prompts in CLASSES.items():
     for i, p in enumerate(prompts):
         h, n, dt, fin = one(p)
         key = (cls, i)
+        if RECORD:
+            rows.append((cls, i, h, n))
+            print("%s[%d] recorded %s tok/s=%.1f n=%d" % (cls, i, h, n / dt, n))
+            continue
         if key not in refs:
             continue
         rh, rn = refs[key]
@@ -100,4 +119,12 @@ for cls, prompts in CLASSES.items():
             diff += 1
         rows.append((cls, i, verdict, n, rn, n / dt))
         print("%s[%d] %s tok/s=%.1f n=%d ref_n=%d" % (cls, i, verdict, n / dt, n, rn))
-print("PARITY: %d same, %d diff (of %d)" % (same, diff, same + diff))
+if RECORD:
+    os.makedirs(os.path.dirname(REFS) or ".", exist_ok=True)
+    json.dump([list(r) for r in rows], open(REFS, "w"), indent=1)
+    print("PARITY: recorded %d references to %s" % (len(rows), REFS))
+elif not refs:
+    print("PARITY: unmeasured (no references at %s; record them with PP2_RECORD_REFS=1)" % REFS)
+    sys.exit(3)
+else:
+    print("PARITY: %d same, %d diff (of %d) vs %s" % (same, diff, same + diff, REFS))
