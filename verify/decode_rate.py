@@ -31,6 +31,13 @@ only. --train-prompt sends the prompt this repository's README numbers are on (t
 in verify/texts_prod.py, with its top_p 0.95; use --tokens 512 as the README did), and
 --prompt-file FILE sends the text of FILE. Without either, the prompt is the essay below.
 
+--temperature T sends that temperature instead of 0, and --temperature server sends
+neither temperature nor top_p, so the lane's own generation defaults apply: what a client
+that sets nothing gets. Every published number of this repository is at temperature 0. A
+sampled run takes another path through the drafter and the verifier, yields another
+number of tokens per round, and its text differs from run to run: read the median and
+the spread over --repeat, and compare two lanes at the same setting only.
+
 --scale S sends steering_scale S with every request (a lane booted with steering).
 --context-words N puts a ledger of about N words in front of the prompt, so that ttft
 measures a cold prefill of that length (about 1.5 tokens a word; the script prints the
@@ -109,17 +116,19 @@ def counters(url: str, timeout: float) -> dict[str, float | None]:
 
 
 def stream_one(url: str, model: str, tokens: int, scale: float | None, timeout: float, prompt: str,
-               top_p: float | None = None) -> dict:
-    """One streamed chat completion: {first, last, tokens, finish} with wall-clock times."""
+               top_p: float | None = None, temperature: float | None = 0) -> dict:
+    """One streamed chat completion: {first, last, tokens, finish} with wall-clock times.
+    temperature None sends no temperature: the lane's own default applies."""
     body: dict = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": tokens,
-        "temperature": 0,
         "stream": True,
         "stream_options": {"include_usage": True},
         "cache_salt": uuid.uuid4().hex,
     }
+    if temperature is not None:
+        body["temperature"] = temperature
     if top_p is not None:
         body["top_p"] = top_p
     if scale is not None:
@@ -167,10 +176,11 @@ def stream_one(url: str, model: str, tokens: int, scale: float | None, timeout: 
 
 
 def measure(url: str, model: str, streams: int, tokens: int, scale: float | None, timeout: float,
-            prompt: str, top_p: float | None = None) -> dict:
+            prompt: str, top_p: float | None = None, temperature: float | None = 0) -> dict:
     before = counters(url, timeout)
     with concurrent.futures.ThreadPoolExecutor(max_workers=streams) as pool:
-        futures = [pool.submit(stream_one, url, model, tokens, scale, timeout, prompt, top_p) for _ in range(streams)]
+        futures = [pool.submit(stream_one, url, model, tokens, scale, timeout, prompt, top_p, temperature)
+                   for _ in range(streams)]
         runs = [future.result() for future in futures]
     # The engine hands a step's output to the streams before it records that step's
     # counters (vllm/v1/engine/async_llm.py:919, then :944): let the last step land.
@@ -227,6 +237,9 @@ def main() -> int:
                         help="the README's prompt (verify/texts_prod.py) with its top_p 0.95; use --tokens 512")
     parser.add_argument("--prompt-file", help="send the text of this file as the prompt")
     parser.add_argument("--top-p", type=float, help="top_p sent with every request (default: not sent)")
+    parser.add_argument("--temperature", default="0",
+                        help="temperature sent with every request (default 0), or 'server': send neither "
+                             "temperature nor top_p, so the lane's own generation defaults apply")
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--json", help="write every run as JSON to this file ('-' = stdout)")
     args = parser.parse_args()
@@ -237,24 +250,36 @@ def main() -> int:
             model = json.loads(response.read())["data"][0]["id"]
     if args.train_prompt and args.prompt_file:
         parser.error("--train-prompt and --prompt-file are two different prompts")
+    server_sampling = args.temperature.strip().lower() == "server"
+    try:
+        temperature = None if server_sampling else float(args.temperature)
+    except ValueError:
+        parser.error("--temperature takes a number or the word server")
+    if temperature is not None and temperature < 0:
+        parser.error("--temperature must not be negative")
     top_p, which = args.top_p, "the essay prompt"
     text = PROMPT
     if args.train_prompt:
         text, which = TRAIN_PROMPT, "the README's train prompt"
-        top_p = 0.95 if top_p is None else top_p
+        if not server_sampling:  # with the lane's own defaults nothing is added to the request
+            top_p = 0.95 if top_p is None else top_p
     elif args.prompt_file:
         with open(args.prompt_file, encoding="utf-8") as handle:
             text, which = handle.read().strip(), f"the prompt in {args.prompt_file}"
     prompt = (context(args.context_words) if args.context_words else "") + text
-    settle = stream_one(url, model, 16, args.scale, args.timeout, prompt, top_p)  # one request to settle the lane
+    settle = stream_one(url, model, 16, args.scale, args.timeout, prompt, top_p, temperature)  # settles the lane
     print(f"lane {model} at {url}; {which}, {settle['prompt_tokens']} prompt tokens, max_tokens {args.tokens}, "
+          f"temperature {'not sent (the lane decides)' if temperature is None else f'{temperature:g}'}, "
           f"top_p {'not sent' if top_p is None else top_p}, "
           f"steering_scale {'not sent' if args.scale is None else args.scale}; median of {args.repeat} runs")
+    if temperature != 0:
+        print("sampled requests: the text differs from run to run and tokens per round with it. Read the "
+              "median and the spread, and compare with another lane at this same setting only")
     print(f"{'streams':>7} {'ttft s':>7} {'tok/s per stream':>17} {'tok/s aggregate':>16} {'with ttft':>10} "
           f"{'tokens/round':>13} {'ms/round':>9}  notes")
     everything = []
     for streams in [int(v) for v in args.streams.split(",")]:
-        runs = [measure(url, model, streams, args.tokens, args.scale, args.timeout, prompt, top_p)
+        runs = [measure(url, model, streams, args.tokens, args.scale, args.timeout, prompt, top_p, temperature)
                 for _ in range(args.repeat)]
         everything.append(runs)
         mid = sorted(runs, key=lambda r: r["tok_s_aggregate"])[len(runs) // 2]
@@ -280,7 +305,8 @@ def main() -> int:
               f"{'; '.join(notes)}")
     if args.json:
         payload = json.dumps({"url": url, "model": model, "tokens": args.tokens, "scale": args.scale, "prompt": which,
-                              "top_p": top_p, "context_words": args.context_words, "runs": everything}, indent=2)
+                              "top_p": top_p, "temperature": "server" if temperature is None else temperature,
+                              "context_words": args.context_words, "runs": everything}, indent=2)
         if args.json == "-":
             print(payload)
         else:

@@ -184,6 +184,21 @@ def main() -> int:
           status == 0 and body.get("messages", [{}])[0].get("content", "").startswith("A train leaves at 60 mph.")
           and body.get("top_p") == 0.95 and body.get("max_tokens") == 64 and body.get("temperature") == 0
           and "train prompt" in text, f"top_p {body.get('top_p')}, max_tokens {body.get('max_tokens')}")
+    # What real clients send is not temperature 0: the tool can send theirs, or nothing.
+    toy = Toy(0.05, 0.002, 4)
+    status, _, text = run(toy, "--streams", "1", "--train-prompt", "--tokens", "64", "--temperature", "0.7")
+    body = toy.last_body
+    check("a temperature of the caller's choosing", status == 0 and body.get("temperature") == 0.7
+          and body.get("top_p") == 0.95 and "temperature 0.7," in text and "sampled requests" in text,
+          f"sent temperature {body.get('temperature')}, top_p {body.get('top_p')}")
+    toy = Toy(0.05, 0.002, 4)
+    status, sampled, text = run(toy, "--streams", "1", "--train-prompt", "--tokens", "64", "--temperature", "server")
+    body = toy.last_body
+    check("the lane's own sampling defaults", status == 0 and "temperature" not in body and "top_p" not in body
+          and "temperature not sent (the lane decides)" in text and sampled.get("temperature") == "server",
+          "neither temperature nor top_p in the request")
+    status, _, text = run(Toy(0.05, 0.002, 4), "--streams", "1", "--temperature", "warm")
+    check("a temperature that is no number is refused", status == 2 and "a number or the word server" in text, "exit 2")
     one = middle(data, 0) if data else {}
     check("tokens over wall time is reported beside it", 0 < one.get("tok_s_with_ttft", 0) < one.get("tok_s_per_stream", 0),
           f"{one.get('tok_s_with_ttft', 0):.0f} with the first token's latency, {one.get('tok_s_per_stream', 0):.0f} after it")

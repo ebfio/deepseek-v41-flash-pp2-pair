@@ -363,10 +363,19 @@ all pass. T4 needed four instruments:
 - The decisive defect was in the metric: revisions up to 4 compared only tokens named in
   *both* top-20 lists, so a list that loses its leading token reads as distance ≈ 0. A
   tracer that replaces the leading token measured 0.008 while the text differed 4/4.
-  Revision 5 measures what the two lists prove and decides it: 621 positions screened, 216
-  differ by ≥0.2, and off-own positions are no more frequent in mixed bursts than in
-  single-scale ones (46/384 vs 59/420 at scale 0, 63/416 vs 47/413 at scale 1; smallest
-  p = 0.0673 against a FAIL bar of 0.00025; 0 and 1 swaps respectively).
+  Revision 5 measures what the two lists prove and decides it. 621 positions were screened
+  and 216 differ by ≥0.2 between the scales, so the effect is visible. Mixed bursts against
+  single-scale bursts, positions off their own answer: **12.0% vs 14.0% at scale 0**
+  (46/384 vs 59/420, p = 0.835) and **15.1% vs 11.4% at scale 1** (63/416 vs 47/413,
+  p = 0.067) — mixed is not worse than single, and the smallest of the four tests sits two
+  orders of magnitude above the 0.0125 bar. Swaps onto the other scale's answer: 0 and 1
+  against 0 and 1.
+
+  Quote the fault users would actually see: **no request was served at another request's
+  scale, to within about 3–4% of positions** (12 of 384 at scale 0 and 15 of 416 at scale 1
+  would have been needed to fail). A row crossed on one stage only shows as "off its own
+  answer", where this lane's own batch effect (11–14% in single-scale bursts) is larger
+  than anything mixed batching adds.
 
 **T5** (each stage steers on its own) needs `VLLM_STEERING_DEBUG=1` and `--debug-ranks`;
 **T8** (decode vs prefill) stayed inconclusive.
