@@ -5,7 +5,7 @@ box whose GPU is busy serving.
 
 Run it in the image with the same mounts and environment serve_vllm_node.sh sets up:
 
-    SIDECAR=/path/to/warmind-v1.1-orth4c-steering.safetensors
+    SIDECAR=/path/to/<sidecar>.safetensors
     docker run --rm --entrypoint python3 \
         -e CUDA_VISIBLE_DEVICES= -e PYTHONPATH=/opt/pp2-flag \
         -e PP2_STEERING_SIDECAR=/opt/pp2-steering-sidecar/steering.safetensors \

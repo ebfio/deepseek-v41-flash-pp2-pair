@@ -15,7 +15,7 @@ check_hbm() { # host label, command prefix
   if [[ -z "$used" ]]; then say "$label GB300" "UNREADABLE"; fail=1
   elif (( used > 8192 )); then say "$label idle HBM" "${used} MiB used (retained HBM; see ../../dgx-station-guide/ safe recovery, do not compensate)"; fail=1
   else say "$label idle HBM" "${used} MiB used (ok)"; fi
-  # count compute processes on the GB300 only (hades also hosts RTX 4000 services)
+  # count compute processes on the GB300 only (a box may host other services' GPUs)
   local gpu; gpu="$("$@" nvidia-smi --query-gpu=uuid,name --format=csv,noheader 2>/dev/null | awk -F', ' '$2 ~ /GB300/ {print $1}')"
   local procs; procs="$("$@" nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader 2>/dev/null | awk -F', ' -v u="$gpu" '$1 == u' | wc -l)"
   (( procs == 0 )) && say "$label GB300 processes" "none" || { say "$label GB300 processes" "$procs running"; fail=1; }

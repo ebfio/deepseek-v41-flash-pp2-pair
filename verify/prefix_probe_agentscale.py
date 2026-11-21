@@ -23,9 +23,10 @@ SECTION = (
     "rotation includes seven engineers across three time zones. Escalation goes "
     "to the platform lead after two failed restarts. "
 )
-HOSTS = ["erebus", "hades", "proteus", "acheron", "selene", "thea", "nemesis"]
-SVCS = ["vllm-dsv41", "vllm-glm53", "asr-qwen3", "omnivoice", "exporter"]
-SYSTEM = "You are Aline, the fleet operations agent. Use the runbook below.\n\n" + "".join(
+# Fill in your own hosts; the probe only needs a handful of plausible names.
+HOSTS = ["node-a", "node-b", "node-c", "node-d", "node-e", "node-f", "node-g"]
+SVCS = ["svc-alpha", "svc-beta", "svc-gamma", "svc-delta", "exporter"]
+SYSTEM = "You are the fleet operations agent. Use the runbook below.\n\n" + "".join(
     SECTION.format(
         n=i, host=HOSTS[i % 7], svc=SVCS[i % 5], port=8000 + (i % 40), gb=40 + (i % 60)
     )
@@ -33,9 +34,9 @@ SYSTEM = "You are Aline, the fleet operations agent. Use the runbook below.\n\n"
 )
 
 TURNS = [
-    "Summarize the restart policy from the runbook in two paragraphs, then list every host that runs vllm-dsv41.",
-    "Now explain the escalation path in detail. If erebus failed twice at 3am, walk through exactly what happens, step by step, in about 400 words.",
-    "Write a short incident report template based on this runbook, with six fields and guidance for each. Then fill in a sample for a hypothetical asr-qwen3 crash.",
+    "Summarize the restart policy from the runbook in two paragraphs, then list every host that runs svc-alpha.",
+    "Now explain the escalation path in detail. If node-a failed twice at 3am, walk through exactly what happens, step by step, in about 400 words.",
+    "Write a short incident report template based on this runbook, with six fields and guidance for each. Then fill in a sample for a hypothetical svc-gamma crash.",
     "Draft the weekly log-rotation review checklist: ten items, each with a one-line rationale grounded in the runbook.",
     "Compose an on-call handover note covering the rotation, the escalation policy, and the three most fragile services, with reasoning.",
     "Based on everything above, write a one-page fleet health briefing as you would send it, then annotate it with which runbook sections each claim comes from.",

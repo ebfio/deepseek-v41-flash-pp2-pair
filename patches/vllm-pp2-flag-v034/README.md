@@ -130,7 +130,7 @@ tree still has the three pieces.
 **Confirmed on the pair** (Iris, 2026-11-20). The checkpoint's
 `text_config.kv_source_layer_ids` is `[2, 8, 14, 20]`, so the cut is 20 and rank 1 holds
 layers 20 to 39. Rank 1's log of the boot that died
-(`/opt/gb300-pair/logs/live-rank1-20261120T131629.log` on hades) has the traceback:
+(rank 1's log of that boot) has the traceback:
 `(Worker_PP1 pid=341) ERROR [multiproc_executor.py:1223]`, `assert residual is not None and
 post_mix is not None`, `AssertionError`; rank 0's has `Available KV cache memory: 80.39
 GiB` and then `RuntimeError: Worker failed with error ''`. A boot with the guard and

@@ -380,15 +380,15 @@ all pass. T4 needed four instruments:
 **T5** (each stage steers on its own) needs `VLLM_STEERING_DEBUG=1` and `--debug-ranks`;
 **T8** (decode vs prefill) stayed inconclusive.
 
-### Serving both from one lane (litellm)
+### Serving two names from one lane
 
 One engine, two ids: the plain id with no body field, and a second alias carrying
 `extra_body: {steering_scale: 1.0}`. Two traps, both silent:
 
 1. **The alias must send the engine's own model name.** vLLM validates the request's
    `model` field (flare does not), so an alias whose public name differs from the served
-   name needs an explicit `model_id` in the litellm deployment.
-2. **A `dsv41_chronarion` block renders two deployments** — `<name>@<host>`, which carries
+   name needs an explicit `model_id` in the router's deployment entry.
+2. **One router backend template renders two deployments** — `<name>@<host>`, which carries
    `extra_body`, and a public group from the affinity loop, which does not. Requests land on
    the public group, so the steering body is dropped and the alias serves vanilla under a
    steered name. Give the steered alias a single-deployment backend.

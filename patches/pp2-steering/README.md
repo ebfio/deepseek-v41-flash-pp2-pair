@@ -43,7 +43,7 @@ Two formats load.
 
 | | Published (v1) | Derived (v2) |
 |---|---|---|
-| File | `warmind-v1.1-orth4c-steering.safetensors` from `jcartu/WARMIND-1017-Steering-Sidecar` | written by `verify/sidecar_vs_weights.py --derive` |
+| File | the sidecar published as `jcartu/WARMIND-1017-Steering-Sidecar` | written by `verify/sidecar_vs_weights.py --derive` |
 | Tensors | `layers.{L}.{alpha, direction, attn_row_gain}`, layers 4..36 | `layers.{L}.{attn,shared}.{read, write[, row_gain]}`, FP32 |
 | Operator | both sites: read = `direction`, write = `-alpha * direction`; row gain on the attention output only (the arithmetic of hyperflare-inference PR #404) | whatever rebuilds the abliterated checkpoint; read and write may differ |
 | Refused when | inventory, dtypes or norms differ from the reference loader's rules | its metadata does not say `REBUILT` (checked at interpreter start) |

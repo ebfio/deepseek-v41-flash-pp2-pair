@@ -226,7 +226,7 @@ def measure(url: str, model: str, streams: int, tokens: int, scale: float | None
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
-    parser.add_argument("--url", required=True, help="API base, e.g. http://10.0.42.51:8001")
+    parser.add_argument("--url", required=True, help="API base, e.g. http://127.0.0.1:8001")
     parser.add_argument("--model", help="served model name (default: first of /v1/models)")
     parser.add_argument("--streams", default="1,4", help="concurrencies to measure, in order")
     parser.add_argument("--tokens", type=int, default=1024, help="max_tokens of each stream")

@@ -515,7 +515,7 @@ def median(values: list[float]) -> float:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
-    parser.add_argument("--url", required=True, help="API base, e.g. http://10.0.42.51:8001")
+    parser.add_argument("--url", required=True, help="API base, e.g. http://127.0.0.1:8001")
     parser.add_argument("--model", help="served model name (default: first of /v1/models)")
     parser.add_argument("--refusal-prompts", help="text file, one prompt per line, that the stock model refuses")
     parser.add_argument("--max-tokens", type=int, default=96)
